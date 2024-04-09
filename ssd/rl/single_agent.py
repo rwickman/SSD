@@ -9,7 +9,7 @@ from ssd.rl.species_replay_buffer import SpeciesReplayBuffer
 
 
 class SingleAgent:
-    def __init__(self, args, state_dim, action_dim, max_action):
+    def __init__(self, args, state_dim, action_dim, max_action, behavior_dim):
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.total_it = 0
@@ -21,6 +21,7 @@ class SingleAgent:
                 max_action,
                 self.args.n_layers,
                 self.args.hidden_size,
+                self.args.actor_hidden_size,
                 self.args.gamma,
                 self.args.tau,
                 self.args.policy_noise,
@@ -33,9 +34,9 @@ class SingleAgent:
             self.args, state_dim, self.device).to(self.device)
 
         # Create the species replay buffer that partitions the buffer by species 
-        self.replay_buffer = SpeciesReplayBuffer(
-            state_dim, action_dim,  self.args.skill_dim, self.args.num_species, self.args.replay_capacity)
         
+        self.replay_buffer = SpeciesReplayBuffer(
+            state_dim, action_dim,  self.args.skill_dim, self.args.num_species, behavior_dim, self.args.replay_capacity)        
         self.train_dict = {
             "state_disc_loss": [],
             "ep_return": [],
@@ -47,10 +48,10 @@ class SingleAgent:
     def add_ep_return(self, ep_return):
         self.train_dict["ep_return"].append(ep_return)
 
-    def store(self, species_id, state, action, next_state, reward, skill, done):
+    def store(self, species_id, state, action, next_state, reward, skill, behavior, done):
         """Add an experience into the replay buffer."""
-        self.replay_buffer.add(species_id, state, action, next_state, reward, skill, done)
-        self.diversity_reward_net.add_state(next_state)
+        self.replay_buffer.add(species_id, state, action, next_state, reward, skill, behavior, done)
+        self.diversity_reward_net.add_state(behavior if self.args.use_behavior_disc else next_state)
 
     def train(self, species_id: int):
         self.train_diversity()
@@ -61,13 +62,18 @@ class SingleAgent:
         if self.replay_buffer.min_size < self.args.learning_starts:
             return
         
-        state, action, next_state, _, skill, not_done, species_id = self.replay_buffer.sample(self.args.batch_size)
+        state, action, next_state, env_reward, skill, behavior, not_done, species_id = self.replay_buffer.sample(self.args.batch_size)
         state_disc_loss = self.diversity_reward_net.update(
             next_state, skill, species_id)
 
         # Generate the reward
         species_id_tensor = F.one_hot(species_id.view(-1), self.args.num_species).to(self.device)
         diversity_reward = self.diversity_reward_net.generate_reward(next_state, skill, species_id)
+        reward = self.args.env_reward_lam * env_reward + diversity_reward
+        if self.total_it % 2048 == 0:
+            print("diversity_reward", diversity_reward.view(-1)[:10], diversity_reward.mean())
+            print("env_reward", env_reward.view(-1)[:10], env_reward.mean())
+            print("reward", reward.view(-1)[:10], reward.mean())
 
         # Add the skills to the state
         skill_state = torch.cat((state, skill, species_id_tensor), dim=-1)
@@ -75,7 +81,7 @@ class SingleAgent:
 
         # Train the species' network
         critic_loss, actor_loss = self.td3.train(
-            skill_state, action, skill_next_state, diversity_reward, not_done)
+            skill_state, action, skill_next_state, reward, not_done)
 
         # Log the losses
         self.train_dict[f"critic_loss_{0}"].append(critic_loss.item())

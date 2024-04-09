@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
+from torch.optim import Adam, RAdam
 import hnswlib
 import numpy as np
 
@@ -10,7 +10,7 @@ from ssd.networks.util import RunningMeanStd
 
 
 class NoveltyBuffer:
-    def __init__(self, latent_dim, running_mean_std, device, memory_capacity, k, max_novelty=5.0):
+    def __init__(self, latent_dim, running_mean_std, device, memory_capacity, k, max_novelty=10.0):
         self.latent_dim = latent_dim
         self.rms = running_mean_std
         self.device = device
@@ -31,33 +31,50 @@ class NoveltyBuffer:
         if self.memory_capacity > 0:
             self.knn.add_items(state, np.array([self._idx]))
             self._idx = (self._idx + 1) % self.memory_capacity
+    
+    def add_states(self, state):
+        if self.memory_capacity > 0:
+            idxs = np.arange(self._idx, self._idx + state.shape[0]) % self.memory_capacity
+            self.knn.add_items(state, idxs)
+            self._idx = (idxs[-1] + 1) % self.memory_capacity
 
     def apt_novelty(self, state):
-        # Compute the distances between the current states first
-
-        # Get distance from the buffer
-        if self.memory_capacity > 0:
-            _, dists = self.knn.knn_query(state.detach().cpu().numpy(), k=self.k)
-
-            # dists = np.concatenate((dists, cur_state_dists), axis=1)
-            # dists.sort()
-            
-            # Now only keep the current topk
-            dists = dists[:, :self.k]
-        else:
+        def local_dist(state):
             sim_matrix = torch.norm(state[:, None, :] - state[None, :, :], dim=-1, p=2)
-            cur_state_dists, _ = sim_matrix.topk(self.k, dim=1, largest=False, sorted=True)  # (b1, k)
+            cur_state_dists, _ = sim_matrix.topk(min(self.k, state.shape[0]), dim=1, largest=False, sorted=True)  # (b1, k)
             cur_state_dists = cur_state_dists.detach().cpu().numpy()
             state = state.detach().cpu().numpy()
 
             dists = cur_state_dists
+            return dists
+        
+        def rms_dists(dists):
+            self.rms.update(torch.tensor(dists.reshape(-1)))
+            dists = dists / ((self.rms.var.item() ** 0.5) + 1e-6)
+            return dists
+        
+        try:
+            if self.memory_capacity > 0:
+                # Get distance from the buffer
+                _, dists = self.knn.knn_query(state.detach().cpu().numpy(), k=min(self.k, state.shape[0]))
+            else:
+                dists = local_dist(state)
 
-        if self.rms is not None:
+            dists = rms_dists(dists)
             self.rms.update(torch.tensor(dists.reshape(-1)))
             dists = dists / ((self.rms.var.item() ** 0.5) + 1e-6)
 
-        return torch.tensor(np.log(1 + dists.mean(axis=1)), dtype=torch.float32, device=self.device).unsqueeze(1)
-
+            return torch.tensor(np.log(1 + dists.mean(axis=1)), dtype=torch.float32, device=self.device).unsqueeze(1).clamp(max=self.max_novelty)
+        except Exception as e:
+            print(f"GIVEN {state.shape} self._idx {self._idx} Current Count {self.knn.get_current_count()} Max Elements {self.knn.get_max_elements()}")
+            print(e)
+        
+        try:
+            dists = local_dist(state)
+            dists = rms_dists(dists)
+            return torch.tensor(np.log(1 + dists.mean(axis=1)), dtype=torch.float32, device=self.device).unsqueeze(1)
+        except Exception as e:
+            return torch.zeros(state.shape[0],1, dtype=torch.float32, device=self.device)
 
 class DiversityRewardNet(nn.Module):
     """Aggregates all the different networks used for the unsupervised reward."""
@@ -94,9 +111,13 @@ class DiversityRewardNet(nn.Module):
         else:
             params = list(self.state_disc._state_encoder.parameters()) + list(self.state_disc._skill_species_encoder.parameters())
         
-        self.state_disc_optimizer = Adam(params, lr=self.args.lr)
+        if self.args.optim == "adam":
+            self.state_disc_optimizer = Adam(params, lr=self.args.lr)
+        else:
+            self.state_disc_optimizer = RAdam(params, lr=self.args.lr)
 
-    def generate_reward(self, next_obs, skill, species_id):
+
+    def generate_reward(self, next_obs, skill, species_id, should_log=True):
         with torch.no_grad():
             state_disc_reward = self.state_disc.get_diversity_reward(next_obs, skill, species_id)
             next_obs_latent = self.state_disc.encode_state(next_obs)
@@ -105,10 +126,9 @@ class DiversityRewardNet(nn.Module):
             else:
                 novelty = torch.zeros(state_disc_reward.shape, dtype=torch.float32, device=self.device)
 
+            # print("novelty", novelty)
             diversity_reward = self.args.novelty_lam * novelty + self.args.state_disc_lam * state_disc_reward
-            if  self.total_it % 2048 == 0:
-                
-                print("species_id: ", species_id)
+            if not self.args.render and self.total_it % 4096 == 0 and should_log:
                 print("state_disc_reward", state_disc_reward.view(-1)[:10], state_disc_reward.mean())
                 print("novelty", novelty.view(-1)[:10], novelty.mean(), f"RANGE [{novelty.min()}, {novelty.max()}]")
                 print("diversity_reward", diversity_reward.view(-1)[:10], diversity_reward.mean())
@@ -121,16 +141,24 @@ class DiversityRewardNet(nn.Module):
             return diversity_reward
 
     def add_state(self, obs):
-        if self.args.novelty_lam != 0:
+        if self.args.novelty_lam != 0 and self.args.novelty_capacity > 0:
             obs_latent = self.state_disc.encode_state(
                 torch.tensor(obs, device=self.device, dtype=torch.float32)).detach().cpu().numpy()
             self.novelty_buffer.add_state(obs_latent)
+    
+    def add_states(self, obs):
+        """Add multiple states."""
+        if self.args.novelty_lam != 0 and self.args.novelty_capacity > 0:
+            obs_latent = self.state_disc.encode_state(
+                torch.tensor(obs, device=self.device, dtype=torch.float32)).detach().cpu().numpy()
+            self.novelty_buffer.add_states(obs_latent)
 
     def update(self, obs_next, skill, species_id):
         # Update the state discriminator
         state_disc_loss = self.state_disc.compute_loss(obs_next, skill, species_id)
         self.state_disc_optimizer.zero_grad()
         state_disc_loss.backward()
+        nn.utils.clip_grad_norm_(list(self.state_disc._state_encoder.parameters()) + list(self.state_disc._skill_species_encoder.parameters()), self.args.max_norm)
         self.state_disc_optimizer.step()
         self.state_disc.update_target()
 

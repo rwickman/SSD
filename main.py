@@ -1,9 +1,8 @@
 import argparse
 import gym
 import os, json, time
-import maze_envs
 from tqdm import tqdm
-from maze_envs.wrappers.state_frequency import StateFrequencyWrapper
+
 
 from ssd.args import update_parser
 from ssd.util import set_seed
@@ -27,7 +26,7 @@ def main(args):
             init_pos=args.init_pos,
             render_mode="human" if args.render else None)
     else:
-        gym_env = gym.make(args.env, render_mode="human" if args.render else None)
+        gym_env = gym.make(args.env)
 
     # Create the Environment Runner
     env_runner = EnvRunner(args, gym_env)
@@ -38,14 +37,16 @@ def main(args):
             args,
             gym_env.observation_space.shape[0],
             gym_env.action_space.shape[0],
-            gym_env.action_space.high[0]
+            (gym_env.action_space.low, gym_env.action_space.high),
+            gym_env.observation_space.shape[0],
         )
     else:
         agent = PopulationAgent(
             args,
             gym_env.observation_space.shape[0],
             gym_env.action_space.shape[0],
-            gym_env.action_space.high[0]
+            (gym_env.action_space.low, gym_env.action_space.high),
+            gym_env.observation_space.shape[0],
         )
 
     if args.load:
@@ -98,6 +99,7 @@ if __name__ == "__main__":
         help="Directory to save the results.")
     parser.add_argument("--evals", type=int, default=1024,
         help="Number of times to evaluate the environment.")
-
+    parser.add_argument("--use_behavior_disc", action="store_true",
+        help="Use behavior instead of state for discriminating.")
     args = parser.parse_args()
     main(args)

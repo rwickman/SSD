@@ -3,7 +3,7 @@ import torch
 import os
 
 class ReplayBuffer:
-    def __init__(self, state_dim, action_dim, skill_dim, max_size=int(1e6)):
+    def __init__(self, state_dim, action_dim, skill_dim, behavior_dim, max_size=int(1e6)):
         self.max_size = max_size
         self.skill_dim = skill_dim
         self.ptr = 0
@@ -15,17 +15,19 @@ class ReplayBuffer:
         self.next_state = np.zeros((max_size, state_dim))
         self.reward = np.zeros((max_size, 1))
         self.skill = np.zeros((max_size, skill_dim))
+        self.behavior = np.zeros((max_size, behavior_dim))
         self.not_done = np.zeros((max_size, 1))
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-    def add(self, state, action, next_state, reward, skill, done):
+    def add(self, state, action, next_state, reward, skill, behavior, done):
         self.state[self.ptr] = state
         self.action[self.ptr] = action
         self.next_state[self.ptr] = next_state
         self.reward[self.ptr] = reward
         self.skill[self.ptr] = skill
+        self.behavior[self.ptr] = behavior
         self.not_done[self.ptr] = 1. - done
 
         self.ptr = (self.ptr + 1) % self.max_size
@@ -41,6 +43,7 @@ class ReplayBuffer:
             self.next_state[ind],
             self.reward[ind],
             self.skill[ind],
+            self.behavior[ind],
             self.not_done[ind],
         ]
 
@@ -50,6 +53,8 @@ class ReplayBuffer:
             "action": self.action,
             "next_state": self.next_state,
             "reward": self.reward,
+            "skill": self.skill,
+            "behavior": self.behavior,
             "not_done": self.not_done,
             "ptr": self.ptr,
             "size": self.size,
@@ -67,6 +72,7 @@ class ReplayBuffer:
         self.reward = data["reward"]
         if self.skill_dim > 0:
             self.skill = data["skill"]
+        self.behavior = data["behavior"]
         self.next_state = data["next_state"]
         self.not_done = data["not_done"]
         self.ptr = int(data["ptr"])
@@ -74,14 +80,14 @@ class ReplayBuffer:
 
 
 class SpeciesReplayBuffer:
-    def __init__(self, state_dim, action_dim, skill_dim, num_species, max_size=int(1e6)):
+    def __init__(self, state_dim, action_dim, skill_dim, num_species, behavior_dim, max_size=int(1e6)):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_species = num_species
 
         # Create a replay buffer for each species
         species_buffer_maze_size = max_size//self.num_species # Partition replay buffer into equally-sized chunks
         self._buffers = [
-            ReplayBuffer(state_dim, action_dim, skill_dim, species_buffer_maze_size)
+            ReplayBuffer(state_dim, action_dim, skill_dim, behavior_dim, species_buffer_maze_size)
             for _ in range(self.num_species)
         ]
 
@@ -94,9 +100,9 @@ class SpeciesReplayBuffer:
         """The minimum species buffer size ."""
         return min(b.size for b in self._buffers)
 
-    def add(self, species_id, state, action, next_state, reward,  skill,  done):
+    def add(self, species_id, state, action, next_state, reward,  skill,  behavior, done):
         """Add an experience to a species buffer."""
-        self._buffers[species_id].add(state, action, next_state, reward, skill, done)
+        self._buffers[species_id].add(state, action, next_state, reward, skill, behavior, done)
 
     def sample(self, batch_size: int):
         """Equally sample experiences from each species"""
@@ -105,8 +111,8 @@ class SpeciesReplayBuffer:
         # Number of examples per species to sample
         ex_per_species = batch_size // len(species_ids)
 
-        # states, actions, next_states, rewards, skills, not_dones, species_ids
-        batch = [[], [], [], [], [], [], []]
+        # states, actions, next_states, rewards, skills, behaviors, not_dones, species_ids
+        batch = [[], [], [], [], [], [], [], []]
 
         # Sample all the species
         for i in species_ids:

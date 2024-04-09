@@ -18,8 +18,13 @@ class EnvRunner:
     def run(self, agent, species_id=None, skill=None, train=False):
         ep_skills = [] # Skills used in the episode
         ep_species = []
- 
-        obs, _ = self.env.reset()
+        diversity_dict = {
+            "next_obs": [],
+            "species_id": [],
+            "skills": [],
+        }
+
+        obs = self.env.reset()
         if skill is None:
             skill = sample_skill(self.args.skill_dim)
             ep_skills.append(skill)
@@ -28,12 +33,14 @@ class EnvRunner:
             
         ep_skills.append(skill)
         total_reward = 0
-        
+        resample_skill_freq = random.randint(50, 500) if self.args.randomize_resample else self.args.resample_skill_freq
+        resample_species_freq = random.randint(100, 1000) if self.args.randomize_resample else self.args.resample_species_freq
+
         for t in range(self.args.max_episode_len):
-            if t != 0 and t % self.args.resample_skill_freq == 0:
+            if t != 0 and t % resample_skill_freq == 0:
                 skill = sample_skill(self.args.skill_dim)
                 ep_skills.append(skill)
-            if t != 0 and t % self.args.resample_species_freq == 0:
+            if t != 0 and t % resample_species_freq == 0:
                 species_id = sample_species(self.args.num_species)
                 ep_species.append(species_id)
 
@@ -44,29 +51,43 @@ class EnvRunner:
                 else:
                     action = agent.sample_action(species_id, state)
             else:
-                action = agent.select_action(species_id, state)
+                action = agent.select_action(species_id, state).cpu().numpy().flatten()
             
-            next_obs, reward, done, terminated, _ = self.env.step(action)
+            next_obs, reward, done, _ = self.env.step(action)
             total_reward += reward
             if train:
-                agent.store(species_id, obs, action, next_obs, reward, skill, done or terminated)
+                agent.store(species_id, obs, action, next_obs, reward, skill, obs, done)
+            if self.args.render:
+                self.env.render()
 
             obs = next_obs
+            
+            diversity_dict["next_obs"].append(next_obs)
+            diversity_dict["species_id"].append(species_id)
+            diversity_dict["skills"].append(skill.tolist())
 
             if train and t % self.args.update_freq == 0:
                 agent.train(species_id)
-            if done or terminated:
+            if done:
                 break
-
-        if self.args.render:
-            print("Episode Reward: ", total_reward)
         
+        diversity_reward = agent.get_diversity(
+            diversity_dict["next_obs"],
+            diversity_dict["species_id"],
+            diversity_dict["skills"]
+        ).sum().item()
+
+        agent.store_behaviors(diversity_dict["next_obs"])
+        if self.args.render:
+            print("Episode Reward: ", total_reward, "diversity_reward: ", diversity_reward, "species", species_id, "skill", skill, "steps", t)
+
         ep_info = {
             "species_id": species_id,
             "ep_reward": total_reward,
             "steps": t + 1,
             "skills": ep_skills,
             "species": ep_species,
+            "diversity_reward": diversity_reward
         }
         return t + 1, ep_info
 
